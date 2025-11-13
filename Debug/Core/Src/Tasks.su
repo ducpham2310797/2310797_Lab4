@@ -1,0 +1,5 @@
+Tasks.c:10:6:Task_LED1	8	static
+Tasks.c:14:6:Task_LED2	8	static
+Tasks.c:18:6:Task_LED3	8	static
+Tasks.c:22:6:Task_LED4	8	static
+Tasks.c:26:6:Task_LED5	8	static
