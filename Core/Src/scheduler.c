@@ -1,184 +1,276 @@
 #include "scheduler.h"
-#include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-// Task array
-sTask SCH_tasks_G[SCH_MAX_TASKS];
+/*----------------------------------------------------------------------------
+ * Task Node Structure - Sorted Linked List
+ *---------------------------------------------------------------------------*/
+typedef struct TaskNode {
+    void (*pTask)(void);           // Function pointer to task
+    uint32_t Delay;                 // Delta delay to next execution
+    uint32_t Period;                // Repeat interval (0 = one-shot)
+    uint32_t TaskID;                // Unique identifier
+    struct TaskNode* next;          // Next task in sorted list
+} TaskNode;
 
-// Error code variable
-uint8_t Error_code_G = 0;
+/*----------------------------------------------------------------------------
+ * Global Variables
+ *---------------------------------------------------------------------------*/
+static TaskNode* g_TaskListHead = NULL;  // Head of sorted task list
+static uint32_t g_CurrentTick = 0;        // System tick counter (10ms each)
+static uint32_t g_NextTaskID = 1;         // Auto-increment task ID
+static uint8_t g_ErrorCode = 0;           // Error code register
 
-// Last error code for reporting
-static uint8_t Last_error_code_G = 0;
-static uint32_t Error_tick_count_G = 0;
-
-// Task ID counter
-static uint32_t Task_ID_Counter = 1;
-
-/**
- * @brief Initialize the scheduler
- */
+/*----------------------------------------------------------------------------
+ * SCH_Init() - Initialize the scheduler
+ * - Clears all tasks
+ * - Resets tick counter
+ * - Prepares for operation
+ *---------------------------------------------------------------------------*/
 void SCH_Init(void) {
-    uint8_t i;
-
-    // Clear all tasks
-    for (i = 0; i < SCH_MAX_TASKS; i++) {
-        SCH_Delete_Task(i);
+    // Clear all existing tasks
+    while (g_TaskListHead != NULL) {
+        TaskNode* temp = g_TaskListHead;
+        g_TaskListHead = g_TaskListHead->next;
+        free(temp);
     }
 
-    // Reset error code
-    Error_code_G = 0;
-    Last_error_code_G = 0;
-    Error_tick_count_G = 0;
-
-    // Reset task ID counter
-    Task_ID_Counter = 1;
+    g_TaskListHead = NULL;
+    g_CurrentTick = 0;
+    g_NextTaskID = 1;
+    g_ErrorCode = 0;
 }
 
-/**
- * @brief Update function - called from timer ISR
- */
+/*----------------------------------------------------------------------------
+ * SCH_Update() - CRITICAL: Must be called from Timer ISR every 10ms
+ *
+ * Complexity: O(1) - Only updates head of sorted list!
+ *
+ * This is the KEY optimization that satisfies the requirement:
+ * "O(n) searches in the SCH_Update function" is considered unsatisfactory.
+ *
+ * Called from: HAL_TIM_PeriodElapsedCallback()
+ *---------------------------------------------------------------------------*/
 void SCH_Update(void) {
-    uint8_t Index;
+    g_CurrentTick++;
 
-    // Check all tasks
-    for (Index = 0; Index < SCH_MAX_TASKS; Index++) {
-        // Check if there is a task at this location
-        if (SCH_tasks_G[Index].pTask != NULL) {
-            if (SCH_tasks_G[Index].Delay == 0) {
-                // Task is due to run
-                SCH_tasks_G[Index].RunMe += 1;
-
-                if (SCH_tasks_G[Index].Period != 0) {
-                    // Schedule periodic tasks to run again
-                    SCH_tasks_G[Index].Delay = SCH_tasks_G[Index].Period;
-                }
-            } else {
-                // Not yet ready to run - decrement delay
-                SCH_tasks_G[Index].Delay -= 1;
-            }
-        }
+    // Only decrement the head task's delay (O(1) operation!)
+    // Because list is sorted, only the first task needs checking
+    if (g_TaskListHead != NULL && g_TaskListHead->Delay > 0) {
+        g_TaskListHead->Delay--;
     }
 }
 
-/**
- * @brief Dispatch tasks - runs tasks that are due
- */
-void SCH_Dispatch_Tasks(void) {
-    uint8_t Index;
-
-    // Dispatches (runs) the next task (if one is ready)
-    for (Index = 0; Index < SCH_MAX_TASKS; Index++) {
-        if (SCH_tasks_G[Index].RunMe > 0 && SCH_tasks_G[Index].pTask != NULL) {
-            // Run the task
-            (*SCH_tasks_G[Index].pTask)();
-
-            // Reset/reduce RunMe flag
-            SCH_tasks_G[Index].RunMe -= 1;
-
-            // If this is a one-shot task, remove it
-            if (SCH_tasks_G[Index].Period == 0) {
-                SCH_Delete_Task(SCH_tasks_G[Index].TaskID);
-            }
-        }
-    }
-
-    // Report system status
-    SCH_Report_Status();
-
-    // Enter idle mode (optional)
-    SCH_Go_To_Sleep();
-}
-
-/**
- * @brief Add a task to the scheduler
- * @param pFunction Pointer to the task function
- * @param DELAY Initial delay before first execution (in ticks)
- * @param PERIOD Interval between subsequent executions (in ticks)
- * @return Task ID or SCH_MAX_TASKS if error
- */
-uint32_t SCH_Add_Task(void (*pFunction)(), uint32_t DELAY, uint32_t PERIOD) {
-    uint8_t Index = 0;
-
-    // Find a gap in the array
-    while ((SCH_tasks_G[Index].pTask != NULL) && (Index < SCH_MAX_TASKS)) {
-        Index++;
-    }
-
-    // Have we reached the end of the list?
-    if (Index == SCH_MAX_TASKS) {
-        // Task list is full
-        Error_code_G = ERROR_SCH_TOO_MANY_TASKS;
+/*----------------------------------------------------------------------------
+ * SCH_Add_Task() - Add task to sorted list by insertion
+ *
+ * Parameters:
+ *   pFunction - Pointer to task function (void function(void))
+ *   DELAY     - Initial delay in ticks (1 tick = 10ms)
+ *   PERIOD    - Repeat period in ticks (0 = one-shot task)
+ *
+ * Returns: Task ID (> 0) on success, 0 on failure
+ *
+ * Example:
+ *   SCH_Add_Task(Task_LED1, 0, 50);    // Run every 500ms, start immediately
+ *   SCH_Add_Task(Task_LED2, 100, 100); // Run every 1s, start after 1s
+ *---------------------------------------------------------------------------*/
+uint32_t SCH_Add_Task(void (*pFunction)(void), uint32_t DELAY, uint32_t PERIOD) {
+    if (pFunction == NULL) {
+        g_ErrorCode = ERROR_SCH_TOO_MANY_TASKS;
         return NO_TASK_ID;
     }
 
-    // Add task to the array
-    SCH_tasks_G[Index].pTask = pFunction;
-    SCH_tasks_G[Index].Delay = DELAY;
-    SCH_tasks_G[Index].Period = PERIOD;
-    SCH_tasks_G[Index].RunMe = 0;
-    SCH_tasks_G[Index].TaskID = Task_ID_Counter++;
-
-    // Return task ID
-    return SCH_tasks_G[Index].TaskID;
-}
-
-/**
- * @brief Delete a task from the scheduler
- * @param taskID The ID of the task to delete
- * @return RETURN_NORMAL if successful, RETURN_ERROR otherwise
- */
-uint8_t SCH_Delete_Task(uint32_t taskID) {
-    uint8_t Index;
-    uint8_t Return_code = RETURN_ERROR;
-
-    // Find the task with matching ID
-    for (Index = 0; Index < SCH_MAX_TASKS; Index++) {
-        if (SCH_tasks_G[Index].TaskID == taskID) {
-            // Clear the task
-            SCH_tasks_G[Index].pTask = NULL;
-            SCH_tasks_G[Index].Delay = 0;
-            SCH_tasks_G[Index].Period = 0;
-            SCH_tasks_G[Index].RunMe = 0;
-            SCH_tasks_G[Index].TaskID = 0;
-
-            Return_code = RETURN_NORMAL;
-            break;
-        }
+    // Allocate new task node
+    TaskNode* newTask = (TaskNode*)malloc(sizeof(TaskNode));
+    if (newTask == NULL) {
+        g_ErrorCode = ERROR_SCH_TOO_MANY_TASKS;
+        return NO_TASK_ID;
     }
 
-    if (Return_code == RETURN_ERROR) {
-        Error_code_G = ERROR_SCH_CANNOT_DELETE_TASK;
-    }
+    // Initialize task data
+    newTask->pTask = pFunction;
+    newTask->Period = PERIOD;
+    newTask->TaskID = g_NextTaskID++;
+    newTask->next = NULL;
 
-    return Return_code;
-}
+    /*
+     * Insert in sorted order using DELTA TIME technique
+     *
+     * Example: Tasks at 10ms, 25ms, 30ms stored as:
+     * Head -> [10] -> [15] -> [5] -> NULL
+     *         ^^^     ^^^     ^^^
+     *       10-0    25-10   30-25
+     */
 
-/**
- * @brief Report scheduler status (error codes)
- */
-void SCH_Report_Status(void) {
-    // Check for a new error code
-    if (Error_code_G != Last_error_code_G) {
-        Last_error_code_G = Error_code_G;
-
-        if (Error_code_G != 0) {
-            Error_tick_count_G = 60000; // Display error for 60000 ticks
-        } else {
-            Error_tick_count_G = 0;
+    if (g_TaskListHead == NULL || DELAY < g_TaskListHead->Delay) {
+        // Insert at head
+        newTask->Delay = DELAY;
+        if (g_TaskListHead != NULL) {
+            g_TaskListHead->Delay -= DELAY;
         }
+        newTask->next = g_TaskListHead;
+        g_TaskListHead = newTask;
     } else {
-        if (Error_tick_count_G != 0) {
-            if (--Error_tick_count_G == 0) {
-                Error_code_G = 0; // Reset error code
+        // Find insertion point
+        TaskNode* current = g_TaskListHead;
+        uint32_t accumulatedTime = g_TaskListHead->Delay;
+
+        while (current->next != NULL &&
+               accumulatedTime + current->next->Delay <= DELAY) {
+            accumulatedTime += current->next->Delay;
+            current = current->next;
+        }
+
+        // Insert after current
+        newTask->Delay = DELAY - accumulatedTime;
+        newTask->next = current->next;
+
+        if (current->next != NULL) {
+            current->next->Delay -= newTask->Delay;
+        }
+
+        current->next = newTask;
+    }
+
+    return newTask->TaskID;
+}
+
+/*----------------------------------------------------------------------------
+ * SCH_Dispatch_Tasks() - Execute all tasks that are ready
+ *
+ * Must be called from main loop:
+ *   while(1) {
+ *       SCH_Dispatch_Tasks();
+ *   }
+ *
+ * Complexity: O(k) where k = number of ready tasks
+ *---------------------------------------------------------------------------*/
+void SCH_Dispatch_Tasks(void) {
+    // Process all tasks with Delay == 0
+    while (g_TaskListHead != NULL && g_TaskListHead->Delay == 0) {
+        TaskNode* taskToRun = g_TaskListHead;
+
+        // Remove from head
+        g_TaskListHead = g_TaskListHead->next;
+
+        // Execute the task
+        if (taskToRun->pTask != NULL) {
+            (*taskToRun->pTask)();
+        }
+
+        // Handle periodic tasks
+        if (taskToRun->Period > 0) {
+            // Reschedule periodic task
+            void (*savedFunc)(void) = taskToRun->pTask;
+            uint32_t savedPeriod = taskToRun->Period;
+            uint32_t savedID = taskToRun->TaskID;
+
+            free(taskToRun);
+
+            // Re-add with same ID and period
+            TaskNode* rescheduled = (TaskNode*)malloc(sizeof(TaskNode));
+            if (rescheduled != NULL) {
+                rescheduled->pTask = savedFunc;
+                rescheduled->Period = savedPeriod;
+                rescheduled->TaskID = savedID;
+                rescheduled->next = NULL;
+
+                // Re-insert in sorted order
+                if (g_TaskListHead == NULL || savedPeriod < g_TaskListHead->Delay) {
+                    rescheduled->Delay = savedPeriod;
+                    if (g_TaskListHead != NULL) {
+                        g_TaskListHead->Delay -= savedPeriod;
+                    }
+                    rescheduled->next = g_TaskListHead;
+                    g_TaskListHead = rescheduled;
+                } else {
+                    TaskNode* current = g_TaskListHead;
+                    uint32_t accum = g_TaskListHead->Delay;
+
+                    while (current->next != NULL &&
+                           accum + current->next->Delay <= savedPeriod) {
+                        accum += current->next->Delay;
+                        current = current->next;
+                    }
+
+                    rescheduled->Delay = savedPeriod - accum;
+                    rescheduled->next = current->next;
+
+                    if (current->next != NULL) {
+                        current->next->Delay -= rescheduled->Delay;
+                    }
+
+                    current->next = rescheduled;
+                }
             }
+        } else {
+            // One-shot task, just free it
+            free(taskToRun);
         }
     }
 }
 
-/**
- * @brief Put system to sleep (optional power saving)
- */
-void SCH_Go_To_Sleep(void) {
-    // Optional: Implement sleep mode
-    // __WFI(); // Wait for interrupt
+/*----------------------------------------------------------------------------
+ * SCH_Delete_Task() - Remove task by ID
+ *
+ * Parameters:
+ *   taskID - ID returned by SCH_Add_Task()
+ *
+ * Returns: 1 on success, 0 on failure
+ *---------------------------------------------------------------------------*/
+uint8_t SCH_Delete_Task(uint32_t taskID) {
+    if (g_TaskListHead == NULL) {
+        g_ErrorCode = ERROR_SCH_CANNOT_DELETE_TASK;
+        return 0;
+    }
+
+    TaskNode* current = g_TaskListHead;
+    TaskNode* previous = NULL;
+
+    while (current != NULL) {
+        if (current->TaskID == taskID) {
+            // Found the task to delete
+            if (previous == NULL) {
+                // Deleting head
+                g_TaskListHead = current->next;
+                if (g_TaskListHead != NULL) {
+                    g_TaskListHead->Delay += current->Delay;
+                }
+            } else {
+                // Deleting middle or end
+                previous->next = current->next;
+                if (current->next != NULL) {
+                    current->next->Delay += current->Delay;
+                }
+            }
+
+            free(current);
+            return 1;
+        }
+
+        previous = current;
+        current = current->next;
+    }
+
+    g_ErrorCode = ERROR_SCH_TASK_NOT_FOUND;
+    return 0;
+}
+
+/*----------------------------------------------------------------------------
+ * SCH_Get_Current_Time() - Get current time in milliseconds
+ *
+ * Returns: Time in ms (tick * 10ms)
+ *---------------------------------------------------------------------------*/
+uint32_t SCH_Get_Current_Time(void) {
+    return g_CurrentTick * 10;  // Convert ticks to milliseconds
+}
+
+/*----------------------------------------------------------------------------
+ * SCH_Get_Error_Code() - Get and clear error code
+ *---------------------------------------------------------------------------*/
+uint8_t SCH_Get_Error_Code(void) {
+    uint8_t error = g_ErrorCode;
+    g_ErrorCode = 0;
+    return error;
 }
